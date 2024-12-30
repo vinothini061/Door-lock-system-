@@ -1,0 +1,277 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <esp_camera.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
+// WiFi credentials
+const char* ssid = "Wattstrons"; 
+const char* password = "Wattstrons023";   
+
+// Telegram bot credentials
+String chatId = "2040191695";
+String BOTtoken = "7004804455:AAEYCtW2SwxNhKaQxNU3iSLvpduKJWFAymQ";
+
+WiFiClientSecure clientTCP;
+UniversalTelegramBot bot(BOTtoken, clientTCP);
+
+// Camera pins
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+// Ultrasonic sensor pins
+#define TRIG_PIN 02
+#define ECHO_PIN 14
+
+long duration;
+float distance;
+
+// Control pins for LED, Buzzer, and Relay
+#define FLASH_LED_PIN 4
+bool flashState = LOW;
+int buzzer = 15;
+int relay = 13;
+
+// Telegram bot request delay
+int botRequestDelay = 1000;
+long lastTimeBotRan;
+
+// Function to handle incoming Telegram bot messages
+void handleNewMessages(int numNewMessages);
+
+// Function to send photo via Telegram
+String sendPhotoTelegram();
+
+void setup() {
+  // Disable brownout detector (Commented out)
+  // WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // Start serial communication
+  Serial.begin(115200);
+  
+  // Set pin modes
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(buzzer, OUTPUT);
+  pinMode(relay, OUTPUT);
+  pinMode(FLASH_LED_PIN, OUTPUT);
+
+  digitalWrite(buzzer, LOW);
+  digitalWrite(relay, HIGH);
+  digitalWrite(FLASH_LED_PIN, LOW);
+
+  // Connect to Wi-Fi
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  clientTCP.setCACert(TELEGRAM_CERTIFICATE_ROOT); 
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.print("ESP32-CAM IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Camera setup
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    delay(1000);
+    ESP.restart();
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_framesize(s, FRAMESIZE_CIF);
+
+  // Send a welcome message to Telegram
+  bot.sendMessage(chatId, "Hello! Boss Door Safety system activated\n");
+}
+
+void loop() {
+  // Ultrasonic sensor logic to measure distance
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  duration = pulseIn(ECHO_PIN, HIGH);
+  distance = (duration * 0.034) / 2;
+  Serial.print("Distance: ");
+  Serial.println(distance);
+  
+  bot.sendMessage(chatId, "Distance: " + String(distance) + " cm");
+
+  // If an object is detected within 5 cm, send photos
+  if (distance < 5) {
+    for (int i = 0; i < 3; i++) {
+      sendPhotoTelegram();
+      delay(1000);
+    }
+    bot.sendMessage(chatId, "/buzzer: The alert sound will activate\n/unlock: unlock the door\n");
+  }
+
+  // Handle incoming Telegram bot messages
+  if (millis() > lastTimeBotRan + botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages) {
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastTimeBotRan = millis();
+  }
+
+  delay(1000); // 1 second delay to avoid looping too fast
+}
+
+String sendPhotoTelegram() {
+  const char* myDomain = "api.telegram.org";
+  String getAll = "";
+  String getBody = "";
+
+  // Capture image from the camera
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return "";
+  }
+
+  // Prepare multipart form data
+  String head = "--RandomNerdTutorials\r\n";
+  head += "Content-Disposition: form-data; name=\"photo\"; filename=\"photo.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
+
+  String tail = "\r\n--RandomNerdTutorials--\r\n";
+  size_t totalLen = head.length() + fb->len + tail.length();
+
+  // Connect to Telegram API
+  clientTCP.connect(myDomain, 443);
+  clientTCP.println("POST /bot" + BOTtoken + "/sendPhoto HTTP/1.1");
+  clientTCP.println("Host: " + String(myDomain));
+  clientTCP.println("Content-Length: " + String(totalLen));
+  clientTCP.println("Content-Type: multipart/form-data; boundary=RandomNerdTutorials");
+  clientTCP.println();
+
+  // Send multipart data
+  clientTCP.print(head);
+  clientTCP.write(fb->buf, fb->len);
+  clientTCP.print(tail);
+
+  esp_camera_fb_return(fb); // Return the framebuffer
+
+  int waitTime = 10000; // timeout 10 seconds
+  long startTimer = millis();
+  boolean state = false;
+
+  // Read response from server
+  while ((startTimer + waitTime) > millis()) {
+    while (clientTCP.available()) {
+      char c = clientTCP.read();
+      if (state == true) getBody += String(c);
+      if (c == '\n' && getAll.length() == 0) {
+        state = true;
+      }
+      getAll = "";
+    }
+    if (getBody.length() > 0) break;
+  }
+
+  clientTCP.stop(); // Disconnect from Telegram
+
+  // Print response for debugging
+  Serial.println(getBody);
+  return getBody;
+}
+
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text = bot.messages[i].text;
+    String from_name = bot.messages[i].from_name;
+    if (from_name == "") from_name = "Guest";
+
+    if (text == "/flash") {
+      flashState = !flashState;
+      digitalWrite(FLASH_LED_PIN, flashState);
+      bot.sendMessage(chat_id, flashState ? "Flash ON" : "Flash OFF");
+    }
+
+    if (text == "/pic") {
+      sendPhotoTelegram();
+    }
+
+    if (text == "/buzzer") {
+      bot.sendMessage(chat_id, "Buzzer ON");
+      for (int i = 0; i < 10; i++) {
+        digitalWrite(buzzer, HIGH);
+        delay(500);
+        digitalWrite(buzzer, LOW);
+        delay(500);
+      }
+      bot.sendMessage(chat_id, "Buzzer OFF");
+    }
+
+    if (text == "/unlock") {
+      relay1();
+      bot.sendMessage(chat_id, "Unlocked the door = /lock");
+    }
+
+    if (text == "/lock") {
+      relay2();
+      bot.sendMessage(chat_id, "Locked the door");
+    }
+  }
+}
+
+void relay1() {
+  digitalWrite(relay, LOW);
+}
+
+void relay2() {
+  digitalWrite(relay, HIGH);
+}
